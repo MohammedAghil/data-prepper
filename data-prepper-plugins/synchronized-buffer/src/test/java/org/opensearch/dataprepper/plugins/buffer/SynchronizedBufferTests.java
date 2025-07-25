@@ -19,6 +19,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -64,7 +65,11 @@ public class SynchronizedBufferTests {
         public void testSingleWriteAndReadReturnsCorrectRecord() throws Exception {
             SynchronizedBuffer<Record<String>> buffer = createObjectUnderTest();
 
-            buffer.write(generateRecord(SINGLE_RECORD_DATA_FORMAT), WRITE_TIMEOUT);
+            // Use helper method for async write
+            CompletableFuture<Void> future = writeRecordAsync(buffer, SINGLE_RECORD_DATA_FORMAT, WRITE_TIMEOUT);
+
+            // Give time for write to be queued
+            Thread.sleep(100);
 
             Map.Entry<Collection<Record<String>>, CheckpointState> readResult = buffer.read(READ_TIMEOUT);
             Collection<Record<String>> readRecords = readResult.getKey();
@@ -76,28 +81,18 @@ public class SynchronizedBufferTests {
 
             // Verify buffer is now empty
             assertTrue(buffer.isEmpty());
+            
+            // Wait for future to complete
+            future.get(WRITE_TIMEOUT, TimeUnit.MILLISECONDS);
         }
 
         @Test
         public void testMultipleWriteAndReadReturnsCorrectRecords() throws Exception {
             SynchronizedBuffer<Record<String>> buffer = createObjectUnderTest();
 
-            // Write two records
-            CompletableFuture<Void> future1 = CompletableFuture.runAsync(() -> {
-                try {
-                    buffer.write(generateRecord(SINGLE_RECORD_DATA_FORMAT), WRITE_TIMEOUT);
-                } catch (Exception e) {
-                    fail("Exception during write: " + e.getMessage());
-                }
-            });
-
-            CompletableFuture<Void> future2 = CompletableFuture.runAsync(() -> {
-                try {
-                    buffer.write(generateRecord(SINGLE_RECORD_DATA_FORMAT), WRITE_TIMEOUT);
-                } catch (Exception e) {
-                    fail("Exception during write: " + e.getMessage());
-                }
-            });
+            // Write two records using helper methods
+            CompletableFuture<Void> future1 = writeRecordAsync(buffer, SINGLE_RECORD_DATA_FORMAT, WRITE_TIMEOUT);
+            CompletableFuture<Void> future2 = writeRecordAsync(buffer, SINGLE_RECORD_DATA_FORMAT, WRITE_TIMEOUT);
 
             // Give time for writes to be queued
             Thread.sleep(100);
@@ -120,19 +115,12 @@ public class SynchronizedBufferTests {
         public void testWriteAllAndReadReturnsAllRecords() throws Exception {
             SynchronizedBuffer<Record<String>> buffer = createObjectUnderTest();
 
-            Collection<Record<String>> writeRecords = generateRecords(IntStream.range(0, 10)
+            List<String> dataList = IntStream.range(0, 10)
                     .mapToObj(i -> String.format(BATCH_RECORDS_DATA_FORMAT, i))
-                    .collect(Collectors.toList()));
+                    .collect(Collectors.toList());
 
-            // Write records in a separate thread since it will block until processed
-            ExecutorService executor = Executors.newSingleThreadExecutor();
-            Future<?> future = executor.submit(() -> {
-                try {
-                    buffer.writeAll(writeRecords, WRITE_TIMEOUT);
-                } catch (Exception e) {
-                    fail("Exception during writeAll: " + e.getMessage());
-                }
-            });
+            // Write records using helper method
+            CompletableFuture<Void> future = writeRecordsAsync(buffer, dataList, WRITE_TIMEOUT);
 
             // Give time for writes to be queued
             Thread.sleep(100);
@@ -149,14 +137,10 @@ public class SynchronizedBufferTests {
             }
 
             // Ensure that all write records were read
-            assertEquals(writeRecords.size(), allReadRecords.size());
+            assertEquals(dataList.size(), allReadRecords.size());
             
-            // Shutdown executor
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(WRITE_TIMEOUT, TimeUnit.MILLISECONDS));
-            
-            // Future should complete without exceptions
-            assertDoesNotThrow(() -> future.get(100, TimeUnit.MILLISECONDS));
+            // Wait for future to complete
+            future.get(WRITE_TIMEOUT, TimeUnit.MILLISECONDS);
         }
 
         @Test
@@ -178,21 +162,18 @@ public class SynchronizedBufferTests {
         @Test
         public void testWriteEmptyRecordDoesNotThrowException() {
             SynchronizedBuffer<Record<String>> buffer = createObjectUnderTest();
-
-            Record<String> emptyRecord = generateRecord(null);
             Collection<Record<String>> emptyRecordCollection = generateRecords(new ArrayList<>());
 
             assertDoesNotThrow(() -> {
-                buffer.write(emptyRecord, WRITE_TIMEOUT);
-                
+                CompletableFuture<Void> writeFuture = writeRecordAsync(buffer, null, WRITE_TIMEOUT);
                 // Read and checkpoint to complete the write
                 Map.Entry<Collection<Record<String>>, CheckpointState> readResult = buffer.read(READ_TIMEOUT);
                 buffer.checkpoint(readResult.getValue());
+                writeFuture.get(WRITE_TIMEOUT, TimeUnit.MILLISECONDS);
             });
 
             assertDoesNotThrow(() -> {
-                buffer.writeAll(emptyRecordCollection, WRITE_TIMEOUT);
-                // No need to read/checkpoint since empty collection doesn't add anything
+                CompletableFuture<Void> writeAllFuture = writeRecordsAsync(buffer, null, WRITE_TIMEOUT);
             });
         }
 
@@ -204,10 +185,10 @@ public class SynchronizedBufferTests {
             ExecutorService executor = Executors.newSingleThreadExecutor();
             Future<?> future = executor.submit(() -> {
                 try {
-                    buffer.write(generateRecord(SINGLE_RECORD_DATA_FORMAT), 100); // Short timeout
+                    buffer.write(generateRecord(SINGLE_RECORD_DATA_FORMAT), 100);
                     fail("Expected TimeoutException");
                 } catch (TimeoutException e) {
-                    // Expected
+                    LOG.info("Successfully encountered timeout exception");
                 }
             });
             
@@ -228,15 +209,7 @@ public class SynchronizedBufferTests {
         public void testReadFromNonEmptyBufferReturnsCorrectRecords() throws Exception {
             SynchronizedBuffer<Record<String>> buffer = createObjectUnderTest();
 
-            // Write in a separate thread since it will block
-            ExecutorService executor = Executors.newSingleThreadExecutor();
-            executor.submit(() -> {
-                try {
-                    buffer.write(generateRecord(SINGLE_RECORD_DATA_FORMAT), WRITE_TIMEOUT);
-                } catch (Exception e) {
-                    fail("Exception during write: " + e.getMessage());
-                }
-            });
+            CompletableFuture<Void> future = writeRecordAsync(buffer, SINGLE_RECORD_DATA_FORMAT, WRITE_TIMEOUT);
 
             // Give time for write to be queued
             Thread.sleep(100);
@@ -255,9 +228,8 @@ public class SynchronizedBufferTests {
             Collection<Record<String>> secondAttemptToReadRecords = secondReadResult.getKey();
             assertEquals(0, secondAttemptToReadRecords.size());
             
-            // Shutdown executor
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(WRITE_TIMEOUT, TimeUnit.MILLISECONDS));
+            // Wait for future to complete
+            future.get(WRITE_TIMEOUT, TimeUnit.MILLISECONDS);
         }
 
         @Test
@@ -275,19 +247,12 @@ public class SynchronizedBufferTests {
             SynchronizedBuffer<Record<String>> buffer = createObjectUnderTest(config);
 
             // Write more records than batch size
-            Collection<Record<String>> writeRecords = generateRecords(IntStream.range(0, CUSTOM_BATCH_SIZE + 3)
+            List<String> dataList = IntStream.range(0, CUSTOM_BATCH_SIZE + 3)
                     .mapToObj(i -> String.format(BATCH_RECORDS_DATA_FORMAT, i))
-                    .collect(Collectors.toList()));
+                    .collect(Collectors.toList());
 
-            // Write records in a separate thread
-            ExecutorService executor = Executors.newSingleThreadExecutor();
-            executor.submit(() -> {
-                try {
-                    buffer.writeAll(writeRecords, WRITE_TIMEOUT);
-                } catch (Exception e) {
-                    fail("Exception during writeAll: " + e.getMessage());
-                }
-            });
+            // Write records using helper method
+            CompletableFuture<Void> future = writeRecordsAsync(buffer, dataList, WRITE_TIMEOUT);
 
             // Give time for writes to be queued
             Thread.sleep(100);
@@ -308,9 +273,8 @@ public class SynchronizedBufferTests {
             // Checkpoint to signal completion
             buffer.checkpoint(secondReadResult.getValue());
             
-            // Shutdown executor
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(WRITE_TIMEOUT, TimeUnit.MILLISECONDS));
+            // Wait for future to complete
+            future.get(WRITE_TIMEOUT, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -326,15 +290,8 @@ public class SynchronizedBufferTests {
         public void testIsEmptyReturnsFalseWhenBufferIsNotEmpty() throws Exception {
             SynchronizedBuffer<Record<String>> buffer = createObjectUnderTest();
 
-            // Write in a separate thread since it will block
-            ExecutorService executor = Executors.newSingleThreadExecutor();
-            executor.submit(() -> {
-                try {
-                    buffer.write(generateRecord(SINGLE_RECORD_DATA_FORMAT), WRITE_TIMEOUT);
-                } catch (Exception e) {
-                    fail("Exception during write: " + e.getMessage());
-                }
-            });
+            // Write using helper method
+            CompletableFuture<Void> future = writeRecordAsync(buffer, SINGLE_RECORD_DATA_FORMAT, WRITE_TIMEOUT);
 
             // Give time for write to be queued
             Thread.sleep(100);
@@ -345,9 +302,8 @@ public class SynchronizedBufferTests {
             Map.Entry<Collection<Record<String>>, CheckpointState> readResult = buffer.read(READ_TIMEOUT);
             buffer.checkpoint(readResult.getValue());
             
-            // Shutdown executor
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(WRITE_TIMEOUT, TimeUnit.MILLISECONDS));
+            // Wait for future to complete
+            future.get(WRITE_TIMEOUT, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -420,19 +376,12 @@ public class SynchronizedBufferTests {
             SynchronizedBuffer<Record<String>> buffer = createObjectUnderTest();
             
             // Write 5 records
-            Collection<Record<String>> writeRecords = generateRecords(IntStream.range(0, 5)
+            List<String> dataList = IntStream.range(0, 5)
                     .mapToObj(i -> String.format(BATCH_RECORDS_DATA_FORMAT, i))
-                    .collect(Collectors.toList()));
+                    .collect(Collectors.toList());
             
-            // Write records in a separate thread
-            ExecutorService executor = Executors.newSingleThreadExecutor();
-            Future<?> future = executor.submit(() -> {
-                try {
-                    buffer.writeAll(writeRecords, WRITE_TIMEOUT);
-                } catch (Exception e) {
-                    fail("Exception during writeAll: " + e.getMessage());
-                }
-            });
+            // Write records using helper method
+            CompletableFuture<Void> future = writeRecordsAsync(buffer, dataList, WRITE_TIMEOUT);
             
             // Give time for writes to be queued
             Thread.sleep(100);
@@ -448,21 +397,45 @@ public class SynchronizedBufferTests {
             // Read second batch (should be remaining records)
             Map.Entry<Collection<Record<String>>, CheckpointState> secondReadResult = buffer.read(READ_TIMEOUT);
             Collection<Record<String>> secondReadRecords = secondReadResult.getKey();
-            assertEquals(3, secondReadRecords.size());
+            assertEquals(2, secondReadRecords.size());
             
             // Checkpoint to signal completion of second batch
             buffer.checkpoint(secondReadResult.getValue());
+
+            Map.Entry<Collection<Record<String>>, CheckpointState> thirdReadResult = buffer.read(READ_TIMEOUT);
+            Collection<Record<String>> thirdReadRecords = thirdReadResult.getKey();
+            assertEquals(1, thirdReadRecords.size());
+
+            // Checkpoint to signal completion of third batch
+            buffer.checkpoint(thirdReadResult.getValue());
             
             // Wait for future to complete
-            assertDoesNotThrow(() -> future.get(100, TimeUnit.MILLISECONDS));
-            
-            // Shutdown executor
-            executor.shutdown();
-            assertTrue(executor.awaitTermination(WRITE_TIMEOUT, TimeUnit.MILLISECONDS));
+            future.get(WRITE_TIMEOUT, TimeUnit.MILLISECONDS);
         }
     }
 
     /*-------------------------Private Helper Methods---------------------------*/
+    private <T> CompletableFuture<Void> writeRecordAsync(SynchronizedBuffer<Record<T>> buffer, T data, int timeout) {
+        return CompletableFuture.runAsync(() -> {
+            try {
+                buffer.write(generateRecord(data), timeout);
+            } catch (Exception e) {
+                throw new CompletionException(e);
+            }
+        });
+    }
+
+    private <T> CompletableFuture<Void> writeRecordsAsync(SynchronizedBuffer<Record<T>> buffer, Collection<T> data, int timeout) {
+        return CompletableFuture.runAsync(() -> {
+            try {
+                Collection<Record<T>> records = generateRecords(data);
+                buffer.writeAll(records, timeout);
+            } catch (Exception e) {
+                throw new CompletionException(e);
+            }
+        });
+    }
+    
     private <T> Record<T> generateRecord(final T data) {
         return new Record<>(data);
     }

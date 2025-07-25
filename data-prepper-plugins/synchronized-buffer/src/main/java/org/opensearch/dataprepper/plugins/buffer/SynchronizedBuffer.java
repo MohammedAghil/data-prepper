@@ -10,11 +10,9 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.opensearch.dataprepper.metrics.MetricNames;
 import org.opensearch.dataprepper.metrics.PluginMetrics;
 import org.opensearch.dataprepper.model.CheckpointState;
@@ -23,6 +21,8 @@ import org.opensearch.dataprepper.model.annotations.DataPrepperPluginConstructor
 import org.opensearch.dataprepper.model.buffer.Buffer;
 import org.opensearch.dataprepper.model.configuration.PipelineDescription;
 import org.opensearch.dataprepper.model.record.Record;
+import org.opensearch.dataprepper.plugins.buffer.internal.ReadBatch;
+import org.opensearch.dataprepper.plugins.buffer.internal.SignaledBatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,49 +41,6 @@ public class SynchronizedBuffer<T extends Record<?>> implements Buffer<T> {
     private final Counter writeRecordsCounter;
     private final Counter readRecordsCounter;
     private final int batchSize;
-
-    /**
-     * Represents a batch of records with completion signaling.
-     */
-    static class SignaledBatch<T> {
-        final List<T> records;
-        final AtomicInteger remaining;
-        final AtomicInteger nextSliceIndex;
-        final CompletableFuture<Void> signal;
-
-        SignaledBatch(List<T> records) {
-            this.records = records;
-            this.remaining = new AtomicInteger(records.size());
-            this.nextSliceIndex = new AtomicInteger(0);
-            this.signal = new CompletableFuture<>();
-        }
-
-        List<T> readNext(int maxSize) {
-            int start = nextSliceIndex.getAndAdd(maxSize);
-            if (start >= records.size()) return List.of();
-            int end = Math.min(start + maxSize, records.size());
-            return records.subList(start, end);
-        }
-
-        void markProcessed(int count) {
-            if (remaining.addAndGet(-count) <= 0) {
-                signal.complete(null);
-            }
-        }
-    }
-
-    /**
-     * Tracks batches that have been read for proper checkpointing.
-     */
-    static class ReadBatch<T> {
-        final SignaledBatch<T> batch;
-        final int count;
-
-        ReadBatch(SignaledBatch<T> batch, int count) {
-            this.batch = batch;
-            this.count = count;
-        }
-    }
 
     /**
      * Creates a new SynchronizedBuffer with the specified configuration.
@@ -118,7 +75,7 @@ public class SynchronizedBuffer<T extends Record<?>> implements Buffer<T> {
         writeRecordsCounter.increment();
 
         try {
-            batch.signal.get(timeoutInMillis, TimeUnit.MILLISECONDS);
+            batch.getSignal().get(timeoutInMillis, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             throw new TimeoutException("Writer timed out waiting for checkpoint");
         }
@@ -147,7 +104,7 @@ public class SynchronizedBuffer<T extends Record<?>> implements Buffer<T> {
         writeRecordsCounter.increment(records.size());
 
         try {
-            batch.signal.get(timeoutInMillis, TimeUnit.MILLISECONDS);
+            batch.getSignal().get(timeoutInMillis, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             throw new TimeoutException("Writer timed out waiting for batch checkpoint");
         }
@@ -178,7 +135,7 @@ public class SynchronizedBuffer<T extends Record<?>> implements Buffer<T> {
             output.addAll(slice);
             readBatches.add(new ReadBatch<>(batch, slice.size()));
 
-            if (batch.remaining.get() == 0) {
+            if (batch.getRemaining() == 0) {
                 queue.poll();
             }
         }
@@ -201,7 +158,7 @@ public class SynchronizedBuffer<T extends Record<?>> implements Buffer<T> {
         List<ReadBatch<T>> readBatches = threadLocalReadBatches.get();
         if (readBatches != null) {
             for (ReadBatch<T> rb : readBatches) {
-                rb.batch.markProcessed(rb.count);
+                rb.getBatch().markProcessed(rb.getCount());
             }
             threadLocalReadBatches.remove();
         }
